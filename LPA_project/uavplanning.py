@@ -1,9 +1,23 @@
 import heapq
 import math
+import time
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+
+# ============================================================
+# 0. Matplotlib 中文字体设置
+# ============================================================
+
+matplotlib.rcParams["font.sans-serif"] = [
+    "SimHei",
+    "Microsoft YaHei",
+    "Arial Unicode MS",
+    "DejaVu Sans"
+]
+matplotlib.rcParams["axes.unicode_minus"] = False
 
 
 # ============================================================
@@ -35,12 +49,20 @@ class GridMap3D:
         x0, x1 = x_range
         y0, y1 = y_range
         z0, z1 = z_range
+
         self.occupied[x0:x1, y0:y1, z0:z1] = True
+
+    def add_obstacle_cell(self, node):
+        if self.in_bounds(node):
+            self.occupied[node] = True
 
     def neighbors(self, node):
         """
         三维 26 邻域。
         """
+        if not self.is_free(node):
+            return []
+
         x, y, z = node
         result = []
 
@@ -58,12 +80,87 @@ class GridMap3D:
 
         return result
 
+    def local_cells(self, node, radius=1):
+        """
+        返回 node 周围局部区域，用于 LPA* 障碍物变化后的局部更新。
+        """
+        x, y, z = node
+        cells = []
+
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    nxt = (x + dx, y + dy, z + dz)
+                    if self.in_bounds(nxt):
+                        cells.append(nxt)
+
+        return cells
+
     def world_position(self, node):
         return np.array(node, dtype=float) * self.resolution
 
 
 # ============================================================
-# 2. LPA* 三维路径规划算法
+# 2. A* 三维路径规划
+# ============================================================
+
+class AStar3D:
+    def __init__(self, grid_map):
+        self.map = grid_map
+
+    @staticmethod
+    def heuristic(node, goal):
+        return math.dist(node, goal)
+
+    def plan(self, start, goal):
+        open_heap = []
+        heapq.heappush(open_heap, (self.heuristic(start, goal), 0.0, start))
+
+        g = {start: 0.0}
+        parent = {}
+
+        closed = set()
+        expanded_count = 0
+
+        while open_heap:
+            _, current_g, current = heapq.heappop(open_heap)
+
+            if current in closed:
+                continue
+
+            closed.add(current)
+            expanded_count += 1
+
+            if current == goal:
+                break
+
+            for neighbor, cost in self.map.neighbors(current):
+                new_g = g[current] + cost
+
+                if new_g < g.get(neighbor, float("inf")):
+                    g[neighbor] = new_g
+                    parent[neighbor] = current
+
+                    f = new_g + self.heuristic(neighbor, goal)
+                    heapq.heappush(open_heap, (f, new_g, neighbor))
+
+        if goal not in g:
+            return [], expanded_count, float("inf")
+
+        path = [goal]
+        current = goal
+
+        while current != start:
+            current = parent[current]
+            path.append(current)
+
+        path.reverse()
+
+        return path, expanded_count, g[goal]
+
+
+# ============================================================
+# 3. LPA* 三维路径规划
 # ============================================================
 
 class LPAStar3D:
@@ -78,8 +175,7 @@ class LPAStar3D:
         self.open_heap = []
         self.open_dict = {}
 
-        self.expanded_nodes = []
-        self.search_snapshots = []
+        self.total_expanded_count = 0
 
         self.g[self.start] = float("inf")
         self.rhs[self.start] = 0.0
@@ -99,9 +195,6 @@ class LPAStar3D:
         self.rhs[node] = value
 
     def heuristic(self, node):
-        """
-        启发函数：欧氏距离。
-        """
         return math.dist(node, self.goal)
 
     def calculate_key(self, node):
@@ -126,10 +219,6 @@ class LPAStar3D:
             del self.open_dict[node]
 
     def top_key(self):
-        """
-        获取 OPEN 表最小 key，但不弹出有效节点。
-        会清理 heap 中已经失效的旧条目。
-        """
         while self.open_heap:
             key, node = self.open_heap[0]
 
@@ -141,9 +230,6 @@ class LPAStar3D:
         return float("inf"), float("inf")
 
     def pop_open(self):
-        """
-        弹出 OPEN 表中当前有效的最小节点。
-        """
         while self.open_heap:
             key, node = heapq.heappop(self.open_heap)
 
@@ -154,10 +240,16 @@ class LPAStar3D:
         return None
 
     def update_vertex(self, node):
-        """
-        更新节点 rhs 值。
-        对于普通静态图，前驱节点与邻居节点相同。
-        """
+        if not self.map.in_bounds(node):
+            return
+
+        # 如果节点已经变成障碍物，直接失效
+        if not self.map.is_free(node):
+            self.set_g(node, float("inf"))
+            self.set_rhs(node, float("inf"))
+            self.remove_from_open(node)
+            return
+
         if node != self.start:
             min_rhs = float("inf")
 
@@ -171,70 +263,77 @@ class LPAStar3D:
 
         self.remove_from_open(node)
 
-        if self.get_g(node) != self.get_rhs(node):
+        if abs(self.get_g(node) - self.get_rhs(node)) > 1e-9:
             self.insert(node)
 
-    def compute_shortest_path(self, max_iterations=200000, snapshot_interval=30):
+    def compute_shortest_path(self, max_iterations=1000000):
+        expanded_this_run = 0
         iteration = 0
 
         while (
             self.key_less(self.top_key(), self.calculate_key(self.goal))
-            or self.get_rhs(self.goal) != self.get_g(self.goal)
+            or abs(self.get_rhs(self.goal) - self.get_g(self.goal)) > 1e-9
         ):
-            u = self.pop_open()
+            current = self.pop_open()
 
-            if u is None:
-                print("OPEN 表为空，搜索终止。")
+            if current is None:
                 break
 
-            if self.get_g(u) > self.get_rhs(u):
-                self.set_g(u, self.get_rhs(u))
-                self.expanded_nodes.append(u)
+            if self.get_g(current) > self.get_rhs(current):
+                self.set_g(current, self.get_rhs(current))
 
-                for succ, _ in self.map.neighbors(u):
+                expanded_this_run += 1
+                self.total_expanded_count += 1
+
+                for succ, _ in self.map.neighbors(current):
                     self.update_vertex(succ)
 
             else:
-                self.set_g(u, float("inf"))
-                self.update_vertex(u)
+                self.set_g(current, float("inf"))
+                self.update_vertex(current)
 
-                for succ, _ in self.map.neighbors(u):
+                for succ, _ in self.map.neighbors(current):
                     self.update_vertex(succ)
 
             iteration += 1
 
-            if iteration % snapshot_interval == 0:
-                self.search_snapshots.append(list(self.expanded_nodes))
-
             if iteration >= max_iterations:
-                print("警告：LPA* 达到最大迭代次数，搜索提前终止。")
+                print("警告：LPA* 达到最大迭代次数。")
                 break
 
-        self.search_snapshots.append(list(self.expanded_nodes))
+        return expanded_this_run
+
+    def notify_obstacle_changes(self, changed_cells):
+        """
+        地图中某些栅格变为障碍物后，LPA* 只更新这些栅格及其邻域。
+        这一步是 LPA* 相比 A* 的核心优势。
+        """
+        affected = set()
+
+        for cell in changed_cells:
+            if not self.map.in_bounds(cell):
+                continue
+
+            self.set_g(cell, float("inf"))
+            self.set_rhs(cell, float("inf"))
+            self.remove_from_open(cell)
+
+            affected.add(cell)
+
+            for local_cell in self.map.local_cells(cell, radius=1):
+                affected.add(local_cell)
+
+        for node in affected:
+            self.update_vertex(node)
 
     def extract_path(self):
-        """
-        正确路径提取方式：
-
-        当前 LPA* 从 start 开始传播代价，因此：
-            g(node) 表示 start 到 node 的最短代价估计。
-
-        所以路径应当从 goal 反向回溯：
-            current = goal
-            每次寻找使 g(pred) + cost(pred, current) 最小的前驱节点
-            直到回到 start
-
-        最后再 reverse。
-        """
         if self.get_g(self.goal) == float("inf"):
             return []
 
         path = [self.goal]
         current = self.goal
 
-        visited = set()
-        visited.add(current)
-
+        visited = {current}
         max_path_len = self.map.size_x * self.map.size_y * self.map.size_z
 
         while current != self.start:
@@ -242,23 +341,16 @@ class LPAStar3D:
             best_value = float("inf")
 
             for pred, cost in self.map.neighbors(current):
-                g_pred = self.get_g(pred)
-
-                if g_pred == float("inf"):
-                    continue
-
-                candidate = g_pred + cost
+                candidate = self.get_g(pred) + cost
 
                 if candidate < best_value:
                     best_value = candidate
                     best_pred = pred
 
             if best_pred is None:
-                print("路径提取失败：无法从当前节点找到有效前驱。")
                 return []
 
             if best_pred in visited:
-                print("路径提取失败：出现回溯环路。")
                 return []
 
             path.append(best_pred)
@@ -266,7 +358,6 @@ class LPAStar3D:
             current = best_pred
 
             if len(path) > max_path_len:
-                print("路径提取失败：路径长度异常。")
                 return []
 
         path.reverse()
@@ -274,96 +365,67 @@ class LPAStar3D:
 
 
 # ============================================================
-# 3. 四旋翼三自由度简化动力学模型
+# 4. 地图与动态障碍物设置
 # ============================================================
 
-class Quadrotor3DOF:
+def create_demo_map():
+    grid_map = GridMap3D(40, 30, 12, resolution=1.0)
+
+    # 固定障碍物：三组墙体，每组墙体留出若干通道
+    grid_map.set_obstacle_box((8, 10), (0, 22), (0, 9))
+    grid_map.occupied[8:10, 4:8, 1:6] = False
+    grid_map.occupied[8:10, 18:22, 5:10] = False
+
+    grid_map.set_obstacle_box((18, 20), (8, 30), (2, 12))
+    grid_map.occupied[18:20, 12:16, 3:8] = False
+    grid_map.occupied[18:20, 23:27, 0:5] = False
+
+    grid_map.set_obstacle_box((28, 30), (0, 24), (0, 8))
+    grid_map.occupied[28:30, 3:7, 2:7] = False
+    grid_map.occupied[28:30, 15:20, 4:10] = False
+
+    return grid_map
+
+
+def add_dynamic_obstacle_around_path(grid_map, path, ratio, start, goal):
     """
-    三自由度四旋翼简化模型。
-
-    状态：
-        p = [x, y, z]
-        v = [vx, vy, vz]
-
-    控制输入：
-        a = [ax, ay, az]
-
-    动力学：
-        p_dot = v
-        v_dot = a
-
-    说明：
-        该模型用于路径规划与轨迹跟踪演示。
-        没有显式建模横滚角、俯仰角、偏航角和电机转速。
+    在当前路径上的某个位置附近添加局部障碍物。
+    ratio 表示选择路径上的比例位置。
     """
+    if len(path) < 3:
+        return []
 
-    def __init__(self, position):
-        self.p = np.array(position, dtype=float)
-        self.v = np.zeros(3, dtype=float)
+    index = int(len(path) * ratio)
+    index = max(1, min(index, len(path) - 2))
 
-        self.max_acc = 3.0
-        self.max_speed = 3.0
+    cx, cy, cz = path[index]
 
-    def step(self, target, dt):
-        target = np.array(target, dtype=float)
+    changed_cells = []
 
-        kp = 3.0
-        kd = 2.2
+    # 添加一个小块三维障碍物
+    for x in range(cx - 1, cx + 2):
+        for y in range(cy - 2, cy + 3):
+            for z in range(cz - 1, cz + 2):
+                cell = (x, y, z)
 
-        error_p = target - self.p
-        error_v = -self.v
+                if not grid_map.in_bounds(cell):
+                    continue
 
-        acc_cmd = kp * error_p + kd * error_v
+                if cell == start or cell == goal:
+                    continue
 
-        acc_norm = np.linalg.norm(acc_cmd)
-        if acc_norm > self.max_acc:
-            acc_cmd = acc_cmd / acc_norm * self.max_acc
+                if not grid_map.occupied[cell]:
+                    grid_map.add_obstacle_cell(cell)
+                    changed_cells.append(cell)
 
-        self.v += acc_cmd * dt
-
-        speed = np.linalg.norm(self.v)
-        if speed > self.max_speed:
-            self.v = self.v / speed * self.max_speed
-
-        self.p += self.v * dt
-
-        return self.p.copy(), self.v.copy(), acc_cmd.copy()
-
-
-# ============================================================
-# 4. 路径处理
-# ============================================================
-
-def grid_path_to_world_path(grid_map, path):
-    return [grid_map.world_position(node) for node in path]
-
-
-def densify_path(path, step=0.15):
-    """
-    将离散路径加密，方便四旋翼连续跟踪。
-    """
-    dense = []
-
-    for i in range(len(path) - 1):
-        p0 = np.array(path[i], dtype=float)
-        p1 = np.array(path[i + 1], dtype=float)
-
-        dist = np.linalg.norm(p1 - p0)
-        n = max(2, int(dist / step))
-
-        for j in range(n):
-            alpha = j / n
-            dense.append((1 - alpha) * p0 + alpha * p1)
-
-    dense.append(np.array(path[-1], dtype=float))
-    return dense
+    return changed_cells
 
 
 # ============================================================
 # 5. 可视化函数
 # ============================================================
 
-def draw_box(ax, x0, x1, y0, y1, z0, z1, alpha=0.25):
+def draw_box(ax, x0, x1, y0, y1, z0, z1, color="gray", alpha=0.25):
     vertices = np.array([
         [x0, y0, z0],
         [x1, y0, z0],
@@ -384,11 +446,11 @@ def draw_box(ax, x0, x1, y0, y1, z0, z1, alpha=0.25):
         [vertices[j] for j in [0, 3, 7, 4]],
     ]
 
-    box = Poly3DCollection(faces, alpha=alpha)
+    box = Poly3DCollection(faces, alpha=alpha, facecolor=color, edgecolor="k", linewidths=0.2)
     ax.add_collection3d(box)
 
 
-def setup_3d_axis(ax, grid_map, title):
+def setup_axis_3d(ax, grid_map, title):
     ax.set_title(title)
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
@@ -402,43 +464,113 @@ def setup_3d_axis(ax, grid_map, title):
     ax.grid(True)
 
 
-def plot_obstacles(ax, obstacle_boxes):
-    for box in obstacle_boxes:
-        x0, x1, y0, y1, z0, z1 = box
-        draw_box(ax, x0, x1, y0, y1, z0, z1, alpha=0.3)
+def plot_static_obstacles(ax):
+    """
+    画出固定障碍物。
+    """
+    draw_box(ax, 8, 10, 0, 22, 0, 9, color="gray", alpha=0.20)
+    draw_box(ax, 18, 20, 8, 30, 2, 12, color="gray", alpha=0.20)
+    draw_box(ax, 28, 30, 0, 24, 0, 8, color="gray", alpha=0.20)
 
 
-def draw_quadrotor(ax, position, size=0.35):
-    x, y, z = position
+def plot_dynamic_obstacles(ax, dynamic_cells):
+    """
+    动态障碍物用散点显示。
+    """
+    if len(dynamic_cells) == 0:
+        return
 
-    arm1_x = [x - size, x + size]
-    arm1_y = [y, y]
-    arm1_z = [z, z]
+    arr = np.array(dynamic_cells)
 
-    arm2_x = [x, x]
-    arm2_y = [y - size, y + size]
-    arm2_z = [z, z]
-
-    line1, = ax.plot(arm1_x, arm1_y, arm1_z, linewidth=3)
-    line2, = ax.plot(arm2_x, arm2_y, arm2_z, linewidth=3)
-
-    rotor_points = np.array([
-        [x - size, y, z],
-        [x + size, y, z],
-        [x, y - size, z],
-        [x, y + size, z],
-    ])
-
-    rotors = ax.scatter(
-        rotor_points[:, 0],
-        rotor_points[:, 1],
-        rotor_points[:, 2],
-        s=40
+    ax.scatter(
+        arr[:, 0],
+        arr[:, 1],
+        arr[:, 2],
+        s=20,
+        c="red",
+        marker="s",
+        alpha=0.65,
+        label="Dynamic obstacles"
     )
 
-    body = ax.scatter([x], [y], [z], s=70)
 
-    return [line1, line2, rotors, body]
+def plot_path(ax, path, label, color, linewidth=3, linestyle="-"):
+    if not path:
+        return
+
+    arr = np.array(path)
+
+    ax.plot(
+        arr[:, 0],
+        arr[:, 1],
+        arr[:, 2],
+        color=color,
+        linewidth=linewidth,
+        linestyle=linestyle,
+        label=label
+    )
+
+
+def plot_comparison_charts(records):
+    labels = [record["stage"] for record in records]
+
+    astar_expanded = [record["astar_expanded"] for record in records]
+    lpastar_expanded = [record["lpastar_expanded"] for record in records]
+
+    astar_time = [record["astar_time_ms"] for record in records]
+    lpastar_time = [record["lpastar_time_ms"] for record in records]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    # ----------------------------
+    # 扩展节点数对比
+    # ----------------------------
+    fig1, ax1 = plt.subplots(figsize=(11, 5))
+
+    ax1.bar(x - width / 2, astar_expanded, width, label="A* 从零搜索")
+    ax1.bar(x + width / 2, lpastar_expanded, width, label="LPA* 增量修复")
+
+    ax1.set_title("A* 与 LPA* 每次规划扩展节点数对比")
+    ax1.set_xlabel("规划阶段")
+    ax1.set_ylabel("扩展节点数")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels)
+    ax1.legend()
+    ax1.grid(axis="y", alpha=0.3)
+
+    # ----------------------------
+    # 搜索耗时对比
+    # ----------------------------
+    fig2, ax2 = plt.subplots(figsize=(11, 5))
+
+    ax2.bar(x - width / 2, astar_time, width, label="A* 从零搜索")
+    ax2.bar(x + width / 2, lpastar_time, width, label="LPA* 增量修复")
+
+    ax2.set_title("A* 与 LPA* 每次规划耗时对比")
+    ax2.set_xlabel("规划阶段")
+    ax2.set_ylabel("耗时 / ms")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels)
+    ax2.legend()
+    ax2.grid(axis="y", alpha=0.3)
+
+    # ----------------------------
+    # 累计扩展节点数对比
+    # ----------------------------
+    fig3, ax3 = plt.subplots(figsize=(11, 5))
+
+    astar_cumsum = np.cumsum(astar_expanded)
+    lpastar_cumsum = np.cumsum(lpastar_expanded)
+
+    ax3.plot(labels, astar_cumsum, marker="o", label="A* 累计扩展节点数")
+    ax3.plot(labels, lpastar_cumsum, marker="s", label="LPA* 累计扩展节点数")
+
+    ax3.set_title("A* 与 LPA* 累计搜索代价对比")
+    ax3.set_xlabel("规划阶段")
+    ax3.set_ylabel("累计扩展节点数")
+    ax3.legend()
+    ax3.grid(alpha=0.3)
 
 
 # ============================================================
@@ -446,202 +578,195 @@ def draw_quadrotor(ax, position, size=0.35):
 # ============================================================
 
 def main():
-    # ----------------------------
-    # 地图参数
-    # ----------------------------
-    size_x, size_y, size_z = 24, 18, 10
-    grid_map = GridMap3D(size_x, size_y, size_z, resolution=1.0)
+    start = (1, 2, 1)
+    goal = (38, 27, 9)
 
-    start = (1, 1, 1)
-    goal = (22, 15, 8)
+    grid_map = create_demo_map()
 
-    obstacle_boxes = [
-        (5, 9, 3, 14, 0, 6),
-        (12, 15, 0, 10, 2, 8),
-        (16, 20, 8, 12, 0, 7),
-        (9, 12, 13, 17, 3, 9),
-    ]
-
-    for box in obstacle_boxes:
-        x0, x1, y0, y1, z0, z1 = box
-        grid_map.set_obstacle_box((x0, x1), (y0, y1), (z0, z1))
-
-    # 确保起点和终点不是障碍物
     grid_map.occupied[start] = False
     grid_map.occupied[goal] = False
 
-    print("start free:", grid_map.is_free(start))
-    print("goal free:", grid_map.is_free(goal))
+    astar = AStar3D(grid_map)
+    lpastar = LPAStar3D(grid_map, start, goal)
 
-    # ----------------------------
-    # LPA* 路径规划
-    # ----------------------------
-    planner = LPAStar3D(grid_map, start, goal)
-    planner.compute_shortest_path(
-        max_iterations=200000,
-        snapshot_interval=30
-    )
+    records = []
+    dynamic_obstacles = []
 
-    grid_path = planner.extract_path()
+    # ========================================================
+    # 第 1 阶段：初始规划
+    # ========================================================
 
-    if not grid_path:
-        print("未找到可行路径。")
+    t0 = time.perf_counter()
+    astar_path, astar_expanded, astar_cost = astar.plan(start, goal)
+    t1 = time.perf_counter()
+
+    t2 = time.perf_counter()
+    lpastar_expanded = lpastar.compute_shortest_path()
+    lpastar_path = lpastar.extract_path()
+    lpastar_cost = lpastar.get_g(goal)
+    t3 = time.perf_counter()
+
+    if not astar_path or not lpastar_path:
+        print("初始地图中未找到可行路径。")
         return
 
-    world_path = grid_path_to_world_path(grid_map, grid_path)
-    dense_path = densify_path(world_path, step=0.15)
+    records.append({
+        "stage": "初始规划",
+        "astar_expanded": astar_expanded,
+        "lpastar_expanded": lpastar_expanded,
+        "astar_time_ms": (t1 - t0) * 1000,
+        "lpastar_time_ms": (t3 - t2) * 1000,
+        "astar_cost": astar_cost,
+        "lpastar_cost": lpastar_cost
+    })
 
-    print("========== LPA* 规划结果 ==========")
-    print(f"起点: {start}")
-    print(f"终点: {goal}")
-    print(f"路径节点数: {len(grid_path)}")
-    print(f"扩展节点数: {len(planner.expanded_nodes)}")
-    print(f"路径总代价: {planner.get_g(goal):.3f}")
-    print("===================================")
+    current_lpa_path = lpastar_path
 
-    # ----------------------------
-    # 第一部分：LPA* 搜索过程动画
-    # ----------------------------
-    fig1 = plt.figure(figsize=(10, 8))
-    ax1 = fig1.add_subplot(111, projection="3d")
+    # ========================================================
+    # 第 2 阶段：动态加入障碍物并重规划
+    # ========================================================
 
-    path_np = np.array(world_path)
-    start_np = np.array(start)
-    goal_np = np.array(goal)
+    obstacle_ratios = [0.25, 0.45, 0.65, 0.80]
 
-    def update_search(frame):
-        ax1.clear()
-        setup_3d_axis(ax1, grid_map, "LPA* 三维路径规划过程")
-        plot_obstacles(ax1, obstacle_boxes)
-
-        expanded = planner.search_snapshots[frame]
-
-        if len(expanded) > 0:
-            exp_np = np.array(expanded)
-            ax1.scatter(
-                exp_np[:, 0],
-                exp_np[:, 1],
-                exp_np[:, 2],
-                s=8,
-                alpha=0.35,
-                label="Expanded nodes"
-            )
-
-        ax1.scatter(
-            [start_np[0]], [start_np[1]], [start_np[2]],
-            s=90,
-            marker="o",
-            label="Start"
+    for i, ratio in enumerate(obstacle_ratios, start=1):
+        changed_cells = add_dynamic_obstacle_around_path(
+            grid_map,
+            current_lpa_path,
+            ratio,
+            start,
+            goal
         )
 
-        ax1.scatter(
-            [goal_np[0]], [goal_np[1]], [goal_np[2]],
-            s=120,
-            marker="*",
-            label="Goal"
+        dynamic_obstacles.extend(changed_cells)
+
+        # LPA* 只通知局部变化
+        lpastar.notify_obstacle_changes(changed_cells)
+
+        # A* 从零重新搜索
+        t0 = time.perf_counter()
+        astar_path, astar_expanded, astar_cost = astar.plan(start, goal)
+        t1 = time.perf_counter()
+
+        # LPA* 增量修复
+        t2 = time.perf_counter()
+        lpastar_expanded = lpastar.compute_shortest_path()
+        lpastar_path = lpastar.extract_path()
+        lpastar_cost = lpastar.get_g(goal)
+        t3 = time.perf_counter()
+
+        if not astar_path or not lpastar_path:
+            print(f"第 {i} 次动态重规划后未找到可行路径。")
+            break
+
+        records.append({
+            "stage": f"重规划 {i}",
+            "astar_expanded": astar_expanded,
+            "lpastar_expanded": lpastar_expanded,
+            "astar_time_ms": (t1 - t0) * 1000,
+            "lpastar_time_ms": (t3 - t2) * 1000,
+            "astar_cost": astar_cost,
+            "lpastar_cost": lpastar_cost
+        })
+
+        current_lpa_path = lpastar_path
+
+    # ========================================================
+    # 打印对比结果
+    # ========================================================
+
+    print("\n================ A* 与 LPA* 对比结果 ================")
+    print(f"{'阶段':<10} | {'A*扩展':>8} | {'LPA*扩展':>10} | {'A*耗时/ms':>12} | {'LPA*耗时/ms':>14} | {'A*代价':>10} | {'LPA*代价':>10}")
+    print("-" * 95)
+
+    for record in records:
+        print(
+            f"{record['stage']:<10} | "
+            f"{record['astar_expanded']:>8} | "
+            f"{record['lpastar_expanded']:>10} | "
+            f"{record['astar_time_ms']:>12.3f} | "
+            f"{record['lpastar_time_ms']:>14.3f} | "
+            f"{record['astar_cost']:>10.3f} | "
+            f"{record['lpastar_cost']:>10.3f}"
         )
 
-        if frame == len(planner.search_snapshots) - 1:
-            ax1.plot(
-                path_np[:, 0],
-                path_np[:, 1],
-                path_np[:, 2],
-                linewidth=3,
-                label="LPA* path"
-            )
+    astar_total_expanded = sum(record["astar_expanded"] for record in records)
+    lpastar_total_expanded = sum(record["lpastar_expanded"] for record in records)
 
-        ax1.legend(loc="upper left")
+    astar_total_time = sum(record["astar_time_ms"] for record in records)
+    lpastar_total_time = sum(record["lpastar_time_ms"] for record in records)
 
-    ani1 = FuncAnimation(
-        fig1,
-        update_search,
-        frames=len(planner.search_snapshots),
-        interval=80,
-        repeat=False
+    print("-" * 95)
+    print(f"A* 累计扩展节点数:   {astar_total_expanded}")
+    print(f"LPA* 累计扩展节点数: {lpastar_total_expanded}")
+    print(f"A* 累计耗时/ms:      {astar_total_time:.3f}")
+    print(f"LPA* 累计耗时/ms:    {lpastar_total_time:.3f}")
+
+    if lpastar_total_expanded > 0:
+        ratio = astar_total_expanded / lpastar_total_expanded
+        print(f"扩展节点数优势倍数:  A* / LPA* = {ratio:.2f}")
+
+    print("=====================================================\n")
+
+    # ========================================================
+    # 三维路径结果可视化
+    # ========================================================
+
+    fig = plt.figure(figsize=(11, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    setup_axis_3d(ax, grid_map, "A* 与 LPA* 三维动态重规划结果对比")
+
+    plot_static_obstacles(ax)
+    plot_dynamic_obstacles(ax, dynamic_obstacles)
+
+    final_astar_path = astar_path
+    final_lpastar_path = lpastar_path
+
+    plot_path(
+        ax,
+        final_astar_path,
+        label="A* final path",
+        color="blue",
+        linewidth=2,
+        linestyle="--"
     )
 
-    # 防止动画对象被垃圾回收
-    keep_animation_1 = ani1
-
-    # ----------------------------
-    # 第二部分：四旋翼沿路径飞行动画
-    # ----------------------------
-    quad = Quadrotor3DOF(position=world_path[0])
-
-    dt = 0.04
-    target_index = 0
-    quad_positions = []
-
-    max_steps = 4000
-
-    for _ in range(max_steps):
-        target = dense_path[target_index]
-        pos, vel, acc = quad.step(target, dt)
-        quad_positions.append(pos)
-
-        if np.linalg.norm(pos - target) < 0.18:
-            target_index += 1
-
-            if target_index >= len(dense_path):
-                break
-
-    quad_positions = np.array(quad_positions)
-
-    fig2 = plt.figure(figsize=(10, 8))
-    ax2 = fig2.add_subplot(111, projection="3d")
-
-    def update_quad(frame):
-        ax2.clear()
-        setup_3d_axis(ax2, grid_map, "四旋翼三自由度模型沿 LPA* 路径飞行")
-        plot_obstacles(ax2, obstacle_boxes)
-
-        ax2.scatter(
-            [start_np[0]], [start_np[1]], [start_np[2]],
-            s=90,
-            marker="o",
-            label="Start"
-        )
-
-        ax2.scatter(
-            [goal_np[0]], [goal_np[1]], [goal_np[2]],
-            s=120,
-            marker="*",
-            label="Goal"
-        )
-
-        ax2.plot(
-            path_np[:, 0],
-            path_np[:, 1],
-            path_np[:, 2],
-            linewidth=2,
-            linestyle="--",
-            label="LPA* path"
-        )
-
-        if frame > 1:
-            traj = quad_positions[:frame]
-            ax2.plot(
-                traj[:, 0],
-                traj[:, 1],
-                traj[:, 2],
-                linewidth=2,
-                label="Quadrotor trajectory"
-            )
-
-        draw_quadrotor(ax2, quad_positions[frame], size=0.45)
-
-        ax2.legend(loc="upper left")
-
-    ani2 = FuncAnimation(
-        fig2,
-        update_quad,
-        frames=len(quad_positions),
-        interval=25,
-        repeat=False
+    plot_path(
+        ax,
+        final_lpastar_path,
+        label="LPA* final path",
+        color="green",
+        linewidth=3,
+        linestyle="-"
     )
 
-    # 防止动画对象被垃圾回收
-    keep_animation_2 = ani2
+    ax.scatter(
+        [start[0]],
+        [start[1]],
+        [start[2]],
+        c="orange",
+        s=100,
+        marker="o",
+        label="Start"
+    )
+
+    ax.scatter(
+        [goal[0]],
+        [goal[1]],
+        [goal[2]],
+        c="purple",
+        s=130,
+        marker="*",
+        label="Goal"
+    )
+
+    ax.legend(loc="upper left")
+
+    # ========================================================
+    # 指标图
+    # ========================================================
+
+    plot_comparison_charts(records)
 
     plt.show()
 
